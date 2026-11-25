@@ -59,3 +59,34 @@ class SnapshotMgrService(BaseModuleService):
             "removed": list(set_a - set_b),
             "unchanged": list(set_a & set_b),
         }
+
+    def rollback_snapshot(self, lake_table: str, snapshot_id: str) -> dict[str, Any]:
+        """基于目标快照清单生成新的可用回滚快照，历史快照仍保留。"""
+        target = lake_store.get_snapshot(lake_table, snapshot_id)
+        if target is None:
+            return {"success": False, "ok": False, "error": f"snapshot {snapshot_id} not found"}
+        snapshots = lake_store.list_snapshots(lake_table)
+        current_id = next(
+            (s.snapshot_id for s in reversed(snapshots) if s.status == "available" and s.readable),
+            None,
+        )
+        rollback = lake_store.create_snapshot(
+            lake_table,
+            file_ids=list(target.file_ids),
+            parent_snapshot=current_id,
+            added_rows=0,
+            deleted_rows=0,
+            kind="rollback",
+            label=f"回滚到 {snapshot_id}",
+        )
+        lake_store.mark_snapshot_available(lake_table, rollback.snapshot_id)
+        return {
+            "success": True,
+            "ok": True,
+            "lake_table": lake_table,
+            "target_snapshot_id": snapshot_id,
+            "rollback_snapshot_id": rollback.snapshot_id,
+            "readable_snapshot_id": rollback.snapshot_id,
+            "snapshot_id": rollback.snapshot_id,
+            "file_ids": list(rollback.file_ids),
+        }

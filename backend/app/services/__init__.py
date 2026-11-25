@@ -12,6 +12,7 @@ from app.services.time_travel import TimeTravelService
 from app.services.ingest_watermark import IngestWatermarkService
 from app.services.ingest_batch import IngestBatchService
 from app.services.write_job import WriteJobService
+from app.services.write_withdraw import WriteWithdrawService, write_withdraw_service
 from app.services.compact_job import CompactJobService
 from app.services.expire_policy import ExpirePolicyService
 from app.services.stats_profile import StatsProfileService

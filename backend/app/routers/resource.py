@@ -94,5 +94,14 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
-    return ActionResult(ok=entry is not None, message=message, entry=entry)
+    entry, message = service.run_action(entry_id, payload.action.strip(), payload)
+    action_data = None
+    if entry is not None:
+        action_data = entry.get("refresh_result") or entry.get("last_action_result")
+    return ActionResult(
+        ok=entry is not None,
+        message=message,
+        entry=entry,
+        data=action_data if isinstance(action_data, dict) else None,
+        result=action_data if isinstance(action_data, dict) else None,
+    )

@@ -73,6 +73,22 @@ npm run dev
 | 资源额度计量 | `quota_meter` | 额度读数 | 读数编号、所属湖表、额度类型 |
 | 湖表审计 | `lake_audit` | 审计条目 | 条目编号、所属湖表、操作类型 |
 
+## 写入撤回与消费刷新
+
+写入确认后会生成普通写入回执和可用快照。确认回执丢失时，可在“写入作业 → 详情”中按原
+`withdraw_no` / 撤回编号幂等补取首次处置结果；撤回会把本次新增文件移出当前可消费清单，
+生成新的可回读快照，并保留旧快照和已交付回执在历史视图中。
+
+常用接口：
+
+- `POST /api/write_job/commits`：确认写入并生成回执、可用快照。
+- `POST /api/write_job/withdrawals`：按申请编号、写入回执或文件范围发起撤回/回滚。
+- `GET /api/write_job/withdrawals/{withdraw_no}`：凭原撤回编号补取首次处置结果。
+- `GET /api/write_job/{job_id}/receipts`：查询普通写入、撤回和消费更正回执。
+- `GET /api/write_job/versions/{lake_table}`：核对各版快照和当前可读版本。
+- `POST /api/publish_view/refresh`：刷新消费视图，响应携带 `input_scope`、
+  `affected_inputs`、`withdraw_no` 和 `readable_snapshot_id`。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

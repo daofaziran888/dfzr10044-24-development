@@ -47,9 +47,27 @@
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
-          <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
+          <td v-for="column in meta.fields" :key="column">
+            <RouterLink
+              v-if="meta.key === 'write_job' && column === '作业编号'"
+              class="link"
+              :to="`/write_job/${row.id}`"
+              :data-testid="`job-link-${row.id}`"
+            >
+              {{ row[column] ?? '—' }}
+            </RouterLink>
+            <template v-else>{{ row[column] ?? '—' }}</template>
+          </td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
+            <RouterLink
+              v-if="meta.key === 'write_job'"
+              class="link detail-link"
+              :to="`/write_job/${row.id}`"
+              :data-testid="`detail-${row.id}`"
+            >
+              详情
+            </RouterLink>
             <button
               v-for="action in meta.actions"
               :key="action"
@@ -70,12 +88,38 @@
       </tbody>
     </table>
 
+    <section
+      v-if="actionFeedback"
+      class="receipt-panel"
+      data-testid="action-feedback"
+      :data-ok="String(actionFeedback.ok)"
+    >
+      <div class="panel-head">
+        <h3>最近动作回执</h3>
+        <button class="link" type="button" data-testid="close-feedback" @click="actionFeedback = null">关闭</button>
+      </div>
+      <p data-testid="action-feedback-message">{{ actionFeedback.message }}</p>
+      <template v-if="feedbackLinkage">
+        <div class="linkage-grid">
+          <span>撤回编号：<b data-testid="feedback-withdraw-no">{{ feedbackLinkage.withdraw_no || '—' }}</b></span>
+          <span>申请编号：<b>{{ feedbackLinkage.application_id || feedbackLinkage.apply_no || '—' }}</b></span>
+          <span>可回读快照：<b data-testid="feedback-readable-snapshot">{{ feedbackLinkage.readable_snapshot_id || feedbackLinkage.bound_snapshot || '—' }}</b></span>
+          <span>输入范围：<b data-testid="feedback-input-scope">{{ formatScope(feedbackLinkage.input_scope || feedbackLinkage.affected_input_scope) }}</b></span>
+        </div>
+        <pre class="json-box" data-testid="action-result-json">{{ JSON.stringify(actionFeedback.entry?.refresh_result || actionFeedback, null, 2) }}</pre>
+      </template>
+    </section>
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
-        <label v-for="field in meta.fields" :key="field" class="create-field">
+        <label v-for="(field, fieldIndex) in meta.fields" :key="field" class="create-field">
           <span>{{ field }}</span>
-          <input v-model="createValues[field]" :data-testid="`create-${field}`" required />
+          <input
+            v-model="createValues[field]"
+            :data-testid="`create-${field}`"
+            :required="fieldIndex < 3"
+          />
         </label>
         <div class="page-actions">
           <button class="btn" type="button" @click="showCreate = false">取消</button>
@@ -103,7 +147,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
-import type { EntryRow } from '@/data/types'
+import type { ActionResult, EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -115,14 +159,24 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const actionFeedback = ref<(ActionResult & { entry?: any }) | null>(null)
+const feedbackLinkage = computed<Record<string, any> | null>(() => {
+  const result = actionFeedback.value?.entry?.refresh_result
+  return result && typeof result === 'object' ? result as Record<string, any> : null
+})
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
-  { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
-  {
-    label: meta.metrics[2],
-    value: rows.value.filter((row) => row.status === meta.statuses[meta.statuses.length - 1]).length,
-  },
+  { label: meta.metrics[1], value: countByMetric(meta.metrics[1], 1) },
+  { label: meta.metrics[2], value: countByMetric(meta.metrics[2], 2) },
 ])
+
+function countByMetric(label: string, index: number): number {
+  const preferredStatus = meta.statuses.find((status) => label.includes(status.replace(/量$/, '')))
+    || (label.includes('冲突') ? '提交冲突' : '')
+    || (label.includes('已提交') ? '已提交' : '')
+    || (index === 1 ? meta.statuses[1] : meta.statuses[meta.statuses.length - 1])
+  return rows.value.filter((row) => String(row.status) === preferredStatus).length
+}
 const statusSummary = computed(() =>
   meta.statuses.map((status) => ({
     status,
@@ -133,6 +187,12 @@ const statusSummary = computed(() =>
 function resetFilters() {
   filters.value = {}
   void reload()
+}
+
+function formatScope(scope: Record<string, unknown> | null | undefined): string {
+  if (!scope) return '—'
+  const partitions = scope.partition_keys || scope.partitions || scope.partition_key
+  return `${String(partitions ?? '')} / ${String(scope.row_count ?? scope.affected_row_count ?? '')} 行 / ${(scope.file_ids as unknown[] | undefined)?.length ?? 0} 个文件`
 }
 
 async function exportRows() {
@@ -169,6 +229,7 @@ async function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
   try {
     const result = await applyAction(meta.key, Number(row.id), action)
+    actionFeedback.value = result
     if (!result.ok) throw new Error(result.message)
     await reload()
   } catch (error) {

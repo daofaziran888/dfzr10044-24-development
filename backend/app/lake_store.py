@@ -36,6 +36,10 @@ class PartitionFile:
     file_bytes: int
     file_manifest: str  # 文件内容摘要（MD5）
     created_at: float
+    status: str = "active"  # active | withdrawn | archived
+    rows_data: list[dict[str, Any]] = field(default_factory=list)
+    source_receipt_no: str | None = None
+    withdraw_no: str | None = None
 
 
 # ----------------------------- 快照 -----------------------------
@@ -52,6 +56,10 @@ class LakeSnapshot:
     manifest_checksum: str
     status: str  # generating | available | expired | rolled_back
     created_at: float
+    kind: str = "append"  # append | rollback | withdrawal | compaction
+    label: str = ""
+    input_scope: dict[str, Any] = field(default_factory=dict)
+    readable: bool = True
 
 
 # ----------------------------- 水位 -----------------------------
@@ -130,6 +138,10 @@ class LakeStore:
         # 文件注册表：lake_table -> {file_id -> PartitionFile}
         self._files: dict[str, dict[str, PartitionFile]] = {}
 
+        # 已撤回/归档文件：lake_table -> {file_id -> PartitionFile}
+        # 不进入当前可消费清单，但保留给历史快照、回执和审计视图回读。
+        self._archived_files: dict[str, dict[str, PartitionFile]] = {}
+
         # 快照链：lake_table -> list[LakeSnapshot]（时间序）
         self._snapshots: dict[str, list[LakeSnapshot]] = {}
 
@@ -148,10 +160,49 @@ class LakeStore:
         # 归并中断恢复检查点：merge_id -> {partial_file_ids: [...], ...}
         self._merge_checkpoints: dict[str, dict[str, Any]] = {}
 
+        # 写入申请、普通写入回执、撤回处置和消费端送达回执。
+        # 这些记录是幂等补取、冲突核对和下游影响识别的唯一凭证。
+        self.write_applications: dict[str, dict[str, Any]] = {}
+        self.write_receipts: dict[str, dict[str, Any]] = {}
+        self.withdrawals: dict[str, dict[str, Any]] = {}
+        self.consumer_receipts: dict[str, dict[str, Any]] = {}
+
+    # ---- 回执与申请 ----
+
+    def save_application(self, application_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        self.write_applications[application_id] = record
+        return record
+
+    def get_application(self, application_id: str) -> dict[str, Any] | None:
+        return self.write_applications.get(application_id)
+
+    def save_write_receipt(self, receipt_no: str, record: dict[str, Any]) -> dict[str, Any]:
+        self.write_receipts[receipt_no] = record
+        return record
+
+    def get_write_receipt(self, receipt_no: str) -> dict[str, Any] | None:
+        return self.write_receipts.get(receipt_no)
+
+    def save_withdrawal(self, withdraw_no: str, record: dict[str, Any]) -> dict[str, Any]:
+        self.withdrawals[withdraw_no] = record
+        return record
+
+    def get_withdrawal(self, withdraw_no: str) -> dict[str, Any] | None:
+        return self.withdrawals.get(withdraw_no)
+
+    def save_consumer_receipt(self, receipt_no: str, record: dict[str, Any]) -> dict[str, Any]:
+        self.consumer_receipts[receipt_no] = record
+        return record
+
+    def get_consumer_receipt(self, receipt_no: str) -> dict[str, Any] | None:
+        return self.consumer_receipts.get(receipt_no)
+
     # ---- 文件操作 ----
 
     def register_file(
-        self, lake_table: str, partition_key: str, rows: int, bytes_: int, manifest: str | None = None
+        self, lake_table: str, partition_key: str, rows: int, bytes_: int,
+        manifest: str | None = None, rows_data: list[dict[str, Any]] | None = None,
+        source_receipt_no: str | None = None,
     ) -> PartitionFile:
         file_id = f"{lake_table}-p{partition_key}-{uuid.uuid4().hex[:8]}"
         checksum = manifest or hashlib.md5(f"{lake_table}:{partition_key}:{time.time()}".encode()).hexdigest()
@@ -163,6 +214,8 @@ class LakeStore:
             file_bytes=bytes_,
             file_manifest=checksum,
             created_at=time.time(),
+            rows_data=list(rows_data or []),
+            source_receipt_no=source_receipt_no,
         )
         self._files.setdefault(lake_table, {})[file_id] = pf
         return pf
@@ -173,8 +226,32 @@ class LakeStore:
             files = [f for f in files if f.partition_key == partition_key]
         return files
 
-    def get_file(self, lake_table: str, file_id: str) -> PartitionFile | None:
-        return self._files.get(lake_table, {}).get(file_id)
+    def get_file(self, lake_table: str, file_id: str, include_archived: bool = True) -> PartitionFile | None:
+        active = self._files.get(lake_table, {}).get(file_id)
+        if active is not None:
+            return active
+        if include_archived:
+            return self._archived_files.get(lake_table, {}).get(file_id)
+        return None
+
+    def archive_files(self, lake_table: str, file_ids: list[str],
+                      withdraw_no: str | None = None) -> list[PartitionFile]:
+        """把撤回文件移出当前清单，但保留实体供历史快照和撤回文件回读。"""
+        table_files = self._files.get(lake_table, {})
+        archived_table = self._archived_files.setdefault(lake_table, {})
+        archived: list[PartitionFile] = []
+        for fid in file_ids:
+            pf = table_files.pop(fid, None) or archived_table.get(fid)
+            if pf is None:
+                continue
+            pf.status = "withdrawn"
+            pf.withdraw_no = withdraw_no
+            archived_table[fid] = pf
+            archived.append(pf)
+        return archived
+
+    def list_archived_files(self, lake_table: str) -> list[PartitionFile]:
+        return list(self._archived_files.get(lake_table, {}).values())
 
     def remove_files(self, lake_table: str, file_ids: list[str]) -> int:
         table_files = self._files.get(lake_table, {})
@@ -204,6 +281,10 @@ class LakeStore:
         parent_snapshot: str | None = None,
         added_rows: int = 0,
         deleted_rows: int = 0,
+        kind: str = "append",
+        label: str = "",
+        input_scope: dict[str, Any] | None = None,
+        readable: bool = True,
     ) -> LakeSnapshot:
         snap_id = f"snap-{lake_table}-{uuid.uuid4().hex[:8]}"
         manifest = hashlib.md5(
@@ -219,6 +300,10 @@ class LakeStore:
             manifest_checksum=manifest,
             status="generating",
             created_at=time.time(),
+            kind=kind,
+            label=label,
+            input_scope=dict(input_scope or {}),
+            readable=readable,
         )
         chain = self._snapshots.setdefault(lake_table, [])
         chain.append(snap)
@@ -235,6 +320,16 @@ class LakeStore:
         for snap in self._snapshots.get(lake_table, []):
             if snap.snapshot_id == snapshot_id:
                 snap.status = "expired"
+                return snap
+        return None
+
+    def mark_snapshot_status(self, lake_table: str, snapshot_id: str,
+                             status: str, readable: bool | None = None) -> LakeSnapshot | None:
+        for snap in self._snapshots.get(lake_table, []):
+            if snap.snapshot_id == snapshot_id:
+                snap.status = status
+                if readable is not None:
+                    snap.readable = readable
                 return snap
         return None
 
